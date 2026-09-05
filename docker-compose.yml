@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: socratic_class_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-socratic_class}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-socratic_class}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: socratic_class_backend
+    restart: unless-stopped
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres_dev_password}@db:5432/${POSTGRES_DB:-socratic_class}
+      - AI_PROVIDER=${AI_PROVIDER:-openai}
+      - AI_API_KEY=${AI_API_KEY:-}
+      - AI_BASE_URL=${AI_BASE_URL:-}
+      - AI_MODEL_DEFAULT=${AI_MODEL_DEFAULT:-gpt-4o-mini}
+      - AI_TIMEOUT=${AI_TIMEOUT:-60.0}
+      - AI_MAX_RETRIES=${AI_MAX_RETRIES:-2}
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - .:/app
+    depends_on:
+      db:
+        condition: service_healthy
+    command: uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  pgdata:
+    driver: local
