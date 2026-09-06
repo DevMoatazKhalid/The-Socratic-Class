@@ -70,3 +70,14 @@ This document captures the architectural decisions made for **The Socratic Class
 - **Context**: The AI package must integrate smoothly into the FastAPI backend without exposing LangGraph internal state or creating circular dependencies.
 - **Decision**: Defined `ai/contracts/coach_contract.py` containing Pydantic DTOs (`CoachApiRequest`, `CoachApiResponse`, `VerificationChallengeApiRequest`, etc.) and adapter functions (`run_coach_turn`).
 - **Consequences**: The FastAPI backend can implement endpoints cleanly by simply importing the contract DTOs and adapter functions.
+
+---
+
+## ADR-009: Universal Final-Answer Prohibition & Deterministic Post-Validation Defense
+- **Status**: Accepted
+- **Context**: No assistance policy (`GUIDED`, `ASSISTED`, `OPEN`) should ever permit handing the final assignment solution to the student. Furthermore, LLM response-generation, LLM validation, or validator-proposed rewrites (`revised_response`) can fail or hallucinate an answer giveaway.
+- **Decision**:
+  1. Extended `rule_based_check()` in `ai/guardrails/coach_validator.py` to check universal answer-revealing patterns across ALL policies.
+  2. Fixed the validator rewrite bypass in `nodes.py`: any `revised_response` proposed by the LLM is subjected to deterministic rule checks rather than unconditionally accepted.
+  3. Implemented `final_answer_enforcement()` as an absolute, deterministic last-line-of-defense check that runs in `validate()` and in `emit_interaction()`, safely falling back to a pedagogical reflection prompt if an answer giveaway is detected.
+- **Consequences**: Zero possibility of final-answer leakage bypassing guardrails under any policy, even in the event of LLM misbehavior or rewrite injection.

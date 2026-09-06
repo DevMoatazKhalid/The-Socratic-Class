@@ -100,9 +100,12 @@ flowchart TD
    - **Deterministic Safeguard**: Under `GUIDED` policy on turn 1, any `EXPLANATION` is deterministically downgraded in code to `QUESTION` unless reasoning is already correct.
 5. **`retrieve_context`** (Conditional): Retrieves course materials with strict `course_id` isolation or bounded student history.
 6. **`generate_response`**: Uses `ModelRole.COACH` to formulate supportive, Socratic guidance.
-7. **`validate`**: Evaluates draft against policy guardrails (rule-based checks + lightweight LLM review).
+7. **`validate`**: Evaluates draft against policy guardrails using a three-tier defense:
+   - *Tier 1 (Fast Rules)*: Universal answer-leakage checks across all policies (`GUIDED`, `ASSISTED`, `OPEN`).
+   - *Tier 2 (LLM Review)*: Structured validation using `ModelRole.LIGHTWEIGHT`. Any proposed `revised_response` is re-validated through Tier 1 rather than bypassing checks.
+   - *Tier 3 (Deterministic Enforcement)*: Final safety check (`final_answer_enforcement`) ensuring no answer giveaways survive.
 8. **`safe_fallback`**: Emits a guaranteed safe guiding question if validation fails repeatedly.
-9. **`emit_interaction`**: Extracts observable `evidence_candidates` and `risk_signals` linked to the durable `learning_event.id`.
+9. **`emit_interaction`**: Runs final deterministic enforcement on the response, extracts observable `evidence_candidates` and `risk_signals` linked to the durable `learning_event.id`.
 
 ---
 
