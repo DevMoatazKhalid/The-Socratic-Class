@@ -14,7 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from ai.agents.coach.evidence import extract_evidence_candidates, extract_risk_signals
 from ai.agents.coach.schemas import DiagnosisResult, GeneratedResponse, InterventionDecision
 from ai.agents.coach.state import CoachState
-from ai.guardrails.coach_validator import validate_response
+from ai.guardrails.coach_validator import final_answer_enforcement, validate_response
 from ai.models.llm import ModelRole, get_structured_llm
 from ai.models.schemas import (
     AssistancePolicy,
@@ -218,10 +218,12 @@ def choose_intervention(state: CoachState) -> dict:
             "errors": errors,
         }
 
-    # Code-level enforcement of the policy (section 23): critical constraints
-    # are enforced here, not left to the prompt alone. On a first attempt
-    # under GUIDED, an EXPLANATION is too close to just giving the answer --
-    # downgrade to a guiding QUESTION unless reasoning is already correct.
+    # Code-level enforcement of the policy (section 23, ADR-006): critical
+    # constraints are enforced here, not left to the prompt alone. On a first
+    # attempt under GUIDED, an EXPLANATION is too close to giving away the
+    # solution directly -- downgrade to a guiding QUESTION unless reasoning
+    # is already correct. On revision turns, conceptual explanation is permitted,
+    # with answer-leakage strictly guarded by final_answer_enforcement and validator.
     if (
         policy == AssistancePolicy.GUIDED
         and intervention_type == InterventionType.EXPLANATION
@@ -334,12 +336,30 @@ def validate(state: CoachState) -> dict:
     )
 
     update: dict = {"validation_passed": result.passes, "validation_violations": list(result.violations)}
-    if not result.passes and result.revised_response:
-        # A safe, minimal fix was available -- use it instead of burning a
-        # regeneration retry.
-        update["response"] = result.revised_response
-        update["validation_passed"] = True
-    elif not result.passes:
+
+    if result.passes:
+        # Validation passed — but run deterministic enforcement as final check.
+        is_safe, enforced = final_answer_enforcement(draft)
+        if not is_safe:
+            update["response"] = enforced
+            update["validation_violations"] = list(result.violations) + [
+                "Deterministic enforcement blocked the response after LLM validation passed."
+            ]
+            # Still mark as passed since we replaced with a safe fallback.
+            update["validation_passed"] = True
+    elif result.revised_response:
+        # LLM proposed a rewrite.  Run deterministic enforcement on it.
+        is_safe, enforced = final_answer_enforcement(result.revised_response)
+        if is_safe:
+            update["response"] = enforced
+            update["validation_passed"] = True
+        else:
+            # The rewrite itself is unsafe — discard it, trigger retry.
+            logger.warning(
+                "LLM revised_response failed final_answer_enforcement; discarding."
+            )
+            update["retry_count"] = state.get("retry_count", 0) + 1
+    else:
         update["retry_count"] = state.get("retry_count", 0) + 1
     return update
 
@@ -376,10 +396,18 @@ def safe_fallback_response(state: CoachState) -> dict:
 
 def emit_interaction(state: CoachState) -> dict:
     response = state.get("response") or ""
+
+    # Absolute last-line defense: deterministic enforcement before the
+    # response reaches the student.  This catches anything that slipped
+    # through validation + LLM rewrite.
+    is_safe, enforced_response = final_answer_enforcement(response)
+    if not is_safe:
+        logger.warning("emit_interaction: final_answer_enforcement replaced the response.")
+
     evidence_candidates = extract_evidence_candidates(state)
     risk_signals = extract_risk_signals(state)
     return {
-        "messages": [AIMessage(content=response)],
+        "messages": [AIMessage(content=enforced_response)],
         "evidence_candidates": evidence_candidates,
         "risk_signals": risk_signals,
     }
