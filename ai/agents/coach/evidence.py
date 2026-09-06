@@ -232,4 +232,31 @@ def extract_risk_signals(state: CoachState) -> list[ExternalAIRiskSignal]:
                 )
             )
 
+    # Signal 3: Style shift — formal/structured patterns appear suddenly
+    _FORMAL_MARKERS = (
+        "```",  # markdown code fences
+        "def ",  # function definitions
+        "class ",
+        "# ",  # comments
+        '"""',  # docstrings
+    )
+    prev_formal_count = sum(1 for m in _FORMAL_MARKERS if m in previous_attempt)
+    curr_formal_count = sum(1 for m in _FORMAL_MARKERS if m in current_attempt)
+    if prev_formal_count == 0 and curr_formal_count >= 3 and len_curr > 200:
+        signals.append(
+            ExternalAIRiskSignal(
+                signal="style_shift_between_attempts",
+                observation=(
+                    f"Observable formatting/style shift: prior attempt had {prev_formal_count} "
+                    f"formal markers, current attempt has {curr_formal_count} formal markers "
+                    f"in turn {metadata.turn_index}."
+                ),
+                metadata={
+                    "prior_formal_count": prev_formal_count,
+                    "current_formal_count": curr_formal_count,
+                    "turn_index": metadata.turn_index,
+                },
+            )
+        )
+
     return signals

@@ -14,12 +14,14 @@ def test_rule_based_check_flags_answer_reveal_under_guided():
     assert violations
 
 
-def test_rule_based_check_allows_same_phrase_under_open():
+def test_rule_based_check_flags_answer_reveal_under_open():
+    """Answer-revealing phrases are now blocked under ALL policies."""
     violations = coach_validator.rule_based_check(
         policy=AssistancePolicy.OPEN,
         draft_response="The answer is theta = theta - learning_rate * gradient.",
     )
-    assert violations == []
+    assert violations
+    assert any("answer-revealing" in v for v in violations)
 
 
 def test_rule_based_check_flags_empty_response():
