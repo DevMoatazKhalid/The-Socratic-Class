@@ -71,6 +71,22 @@ class CoachApiRequest(BaseModel):
     conversation: list[ChatMessageDto] = Field(
         default_factory=list, description="Prior windowed turns for this session."
     )
+    prior_diagnosis: Optional[Diagnosis] = Field(
+        default=None,
+        description=(
+            "The `diagnosis` from the previous CoachApiResponse for this "
+            "session, if any -- lets diagnosis/intervention selection adapt "
+            "to what was already found. Optional; the Coach remains "
+            "stateless and never fetches this itself."
+        ),
+    )
+    prior_intervention: Optional[Intervention] = Field(
+        default=None,
+        description=(
+            "The `intervention` from the previous CoachApiResponse for "
+            "this session, if any."
+        ),
+    )
 
 
 class CoachApiResponse(BaseModel):
@@ -119,6 +135,8 @@ def run_coach_turn(
         message=request.message,
         conversation=messages,
         turn_index=request.turn_index,
+        prior_diagnosis=request.prior_diagnosis,
+        prior_intervention=request.prior_intervention,
     )
 
     return CoachApiResponse(

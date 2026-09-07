@@ -3,7 +3,12 @@ from __future__ import annotations
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-INTERVENTION_PROMPT_VERSION = "v1"
+INTERVENTION_PROMPT_VERSION = "v2"
+
+# Threshold below which a diagnosis is treated as uncertain.
+# Mirrors Diagnosis.is_uncertain (ai/models/schemas.py) — do not change
+# this value independently.
+UNCERTAIN_CONFIDENCE_THRESHOLD = 0.4
 
 _SYSTEM_TEMPLATE = """You are the intervention-selection component of an AI Learning Coach.
 Given a diagnosis of the student's learning state, choose ONE intervention type and explain why.
@@ -19,6 +24,13 @@ solution.
 guiding the student's own reasoning over stating the final solution outright.
 - OPEN: more direct assistance is acceptable, but still prefer teaching over just stating \
 answers when the student hasn't tried at all.
+
+Diagnosis confidence guidance:
+- If the diagnosis confidence is low (below {uncertain_threshold}) or the diagnosis is uncertain, \
+strongly favor CLARIFICATION or QUESTION over more committal interventions (such as EXPLANATION, \
+HINT, or GUIDED_DEBUGGING) in order to probe and verify the student's actual understanding first.
+- If the diagnosis confidence is sufficient ({uncertain_threshold} or above), select the most \
+effective pedagogical intervention according to the active policy.
 
 Do not always pick the same intervention as last time unless the situation genuinely calls for \
 repeating it (e.g. the student still hasn't answered the previous question).
@@ -38,15 +50,22 @@ def build_intervention_messages(
     diagnosis_category: str,
     diagnosis_concept: str,
     diagnosis_explanation: str,
+    diagnosis_confidence: float = 1.0,
     is_revision: bool,
     previous_intervention: str,
     turn_index: int,
 ) -> list:
-    system = SystemMessage(content=_SYSTEM_TEMPLATE.format(policy=policy))
+    system = SystemMessage(
+        content=_SYSTEM_TEMPLATE.format(
+            policy=policy,
+            uncertain_threshold=UNCERTAIN_CONFIDENCE_THRESHOLD,
+        )
+    )
     human = (
         f"Diagnosis category: {diagnosis_category}\n"
         f"Concept: {diagnosis_concept or '(none identified)'}\n"
         f"Diagnosis explanation: {diagnosis_explanation}\n"
+        f"Diagnosis confidence: {diagnosis_confidence:.2f}\n"
         f"Is this a revision: {is_revision}\n"
         f"Previous intervention this session: {previous_intervention or '(none, first turn)'}\n"
         f"Turn index: {turn_index}"
