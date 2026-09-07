@@ -35,6 +35,8 @@ from ai.models.schemas import (
     AIInteraction,
     AssistancePolicy,
     CoachResult,
+    Diagnosis,
+    Intervention,
     LearningEvent,
     LearningEventType,
 )
@@ -124,6 +126,8 @@ class Coach:
         message: Optional[str] = None,
         conversation: Optional[list[BaseMessage]] = None,
         turn_index: int = 0,
+        prior_diagnosis: Optional[Diagnosis] = None,
+        prior_intervention: Optional[Intervention] = None,
     ) -> CoachResult:
         """Run one Coach turn.
 
@@ -134,6 +138,17 @@ class Coach:
         `conversation` is prior turns for this session, already trimmed by
         the caller to a reasonable window -- the Coach does not load full
         history itself (section 10).
+
+        `prior_diagnosis` / `prior_intervention` are the `diagnosis_summary`
+        / `intervention` from the *previous* CoachResult for this session,
+        if the caller has one. The Coach is stateless across calls (no
+        checkpointer, no DB access -- see docs/AI_SPEC.md), so it never
+        looks these up itself; if the caller passes them, `diagnose()` and
+        `choose_intervention()` use them to adapt (e.g. "was the same
+        misconception flagged last turn?", "did we already give a HINT?").
+        If omitted, the Coach behaves exactly as before: it only knows
+        whether this is a revision turn (`turn_index > 1`), not the prior
+        diagnosis/intervention specifics.
         """
         current_attempt = attempt if not message else f"{attempt}\n\nStudent message: {message}"
 
@@ -149,8 +164,8 @@ class Coach:
             "messages": list(conversation or []),
             "current_attempt": current_attempt,
             "code_analysis": None,
-            "diagnosis": None,
-            "intervention": None,
+            "diagnosis": prior_diagnosis,
+            "intervention": prior_intervention,
             "evidence_candidates": [],
             "risk_signals": [],
             "retrieved_context": [],

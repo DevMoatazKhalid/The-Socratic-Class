@@ -6,7 +6,13 @@ from langchain_core.messages import AIMessage, HumanMessage
 from ai.agents.coach import nodes as nodes_mod
 from ai.agents.coach.schemas import DiagnosisResult, GeneratedResponse, InterventionDecision
 from ai.agents.coach.state import CoachState
-from ai.models.schemas import AssistancePolicy, Diagnosis, DiagnosisCategory, InterventionType
+from ai.models.schemas import (
+    AssistancePolicy,
+    Diagnosis,
+    DiagnosisCategory,
+    Intervention,
+    InterventionType,
+)
 from ai.tools.course_retrieval import CourseRetrievalError, CourseRetrievalTool
 from ai.tools.student_history import StudentHistoryTool
 from ai.tests.conftest import FakeStructuredLLM
@@ -87,6 +93,41 @@ def test_diagnose_correct_reasoning_not_forced_into_misconception(monkeypatch, t
     assert update["diagnosis"].category == DiagnosisCategory.CORRECT_REASONING
 
 
+def test_diagnose_includes_prior_diagnosis_when_provided(monkeypatch, task_context, metadata):
+    """Regression: diagnose() reads state["diagnosis"] to build a prior-turn
+    summary for the prompt. If the caller supplies a prior diagnosis (via
+    Coach.invoke(prior_diagnosis=...)), it must actually reach the prompt."""
+    fake_result = DiagnosisResult(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="learning_rate",
+        explanation="Still missing the learning-rate scaling.",
+        evidence="theta = theta - gradient",
+        confidence=0.75,
+    )
+    fake_llm = FakeStructuredLLM(result=fake_result)
+    monkeypatch.setattr(nodes_mod, "get_structured_llm", lambda role, schema: fake_llm)
+
+    prior_diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="gradient_descent",
+        explanation="Updated theta directly by the prediction error.",
+        evidence="theta = theta - prediction",
+        confidence=0.8,
+    )
+    metadata.turn_index = 1  # about to become turn 2
+    state = _base_state(
+        task_context, metadata,
+        current_attempt="theta = theta - gradient",
+        diagnosis=prior_diagnosis,
+    )
+    nodes_mod.diagnose(state)
+
+    assert len(fake_llm.calls) == 1
+    prompt_text = "\n".join(m.content for m in fake_llm.calls[0])
+    assert "gradient_descent" in prompt_text
+    assert "MISCONCEPTION" in prompt_text
+
+
 def test_diagnose_handles_llm_failure_gracefully(monkeypatch, task_context, metadata):
     monkeypatch.setattr(
         nodes_mod,
@@ -151,6 +192,48 @@ def test_choose_intervention_allows_explanation_on_revision(monkeypatch, task_co
     assert update["intervention"].type == InterventionType.EXPLANATION
 
 
+def test_choose_intervention_includes_previous_intervention_when_provided(
+    monkeypatch, task_context, metadata
+):
+    """Regression: choose_intervention() reads state["intervention"] to tell
+    the model what intervention was used last turn. If the caller supplies
+    it (via Coach.invoke(prior_intervention=...)), it must reach the prompt
+    instead of always rendering as "(none, first turn)"."""
+    decision = InterventionDecision(
+        intervention_type=InterventionType.HINT,
+        rationale="Already asked a guiding question; escalate to a hint.",
+        needs_course_material=False,
+        needs_student_history=False,
+    )
+    fake_llm = FakeStructuredLLM(result=decision)
+    monkeypatch.setattr(nodes_mod, "get_structured_llm", lambda role, schema: fake_llm)
+
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="learning_rate",
+        explanation="...",
+        evidence="...",
+        confidence=0.7,
+    )
+    prior_intervention = Intervention(
+        type=InterventionType.QUESTION,
+        assistance_level=AssistancePolicy.GUIDED,
+        rationale="probed understanding last turn",
+    )
+    metadata.turn_index = 2
+    state = _base_state(
+        task_context, metadata,
+        diagnosis=diagnosis,
+        intervention=prior_intervention,
+    )
+    nodes_mod.choose_intervention(state)
+
+    assert len(fake_llm.calls) == 1
+    prompt_text = "\n".join(m.content for m in fake_llm.calls[0])
+    assert "QUESTION" in prompt_text
+    assert "(none, first turn)" not in prompt_text
+
+
 def test_choose_intervention_adapts_after_revision_changes_diagnosis(monkeypatch, task_context, metadata):
     """Section 14: a changed diagnosis on revision should be able to produce
     a different intervention than the previous turn."""
@@ -201,6 +284,80 @@ def test_choose_intervention_handles_llm_failure_gracefully(monkeypatch, task_co
     update = nodes_mod.choose_intervention(state)
     assert update["intervention"].type == InterventionType.ENCOURAGEMENT
     assert update["errors"]
+
+
+def test_choose_intervention_forces_clarification_on_low_confidence(monkeypatch, task_context, metadata):
+    """FIX 2: Low-confidence diagnosis (confidence < 0.4) forces CLARIFICATION
+    when the LLM selects a more committal intervention like EXPLANATION."""
+    decision = InterventionDecision(
+        intervention_type=InterventionType.EXPLANATION,
+        rationale="Explaining directly seems best.",
+        needs_course_material=False,
+        needs_student_history=False,
+    )
+    fake_llm = FakeStructuredLLM(result=decision)
+    monkeypatch.setattr(nodes_mod, "get_structured_llm", lambda role, schema: fake_llm)
+
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="learning_rate",
+        explanation="Unclear if student understands step size.",
+        evidence="theta = theta - prediction",
+        confidence=0.3,
+    )
+    metadata.turn_index = 2  # Even on revision where EXPLANATION is normally allowed
+    state = _base_state(task_context, metadata, diagnosis=diagnosis)
+    update = nodes_mod.choose_intervention(state)
+
+    # Must be forced to CLARIFICATION due to low confidence
+    assert update["intervention"].type == InterventionType.CLARIFICATION
+    assert "uncertainty threshold" in update["intervention"].rationale
+
+    # Verify confidence was passed into the prompt
+    assert len(fake_llm.calls) == 1
+    prompt_text = "\n".join(m.content for m in fake_llm.calls[0])
+    assert "0.30" in prompt_text
+
+    # Verify existing response-generation flow remains valid
+    state["intervention"] = update["intervention"]
+    resp_result = GeneratedResponse(
+        response="Could you clarify what you intended by subtracting prediction?",
+        referenced_concepts=["learning_rate"],
+    )
+    monkeypatch.setattr(
+        nodes_mod, "get_structured_llm", lambda role, schema: FakeStructuredLLM(result=resp_result)
+    )
+    gen_update = nodes_mod.generate_response(state)
+    assert gen_update["response"] == resp_result.response
+
+
+def test_choose_intervention_forces_clarification_for_uncertain_category(
+    monkeypatch, task_context, metadata
+):
+    """FIX 3: DiagnosisCategory.UNCERTAIN deterministically forces CLARIFICATION
+    regardless of what the LLM returns, even if confidence is reported as high."""
+    decision = InterventionDecision(
+        intervention_type=InterventionType.HINT,
+        rationale="Give a small hint to nudge the student.",
+        needs_course_material=False,
+        needs_student_history=False,
+    )
+    monkeypatch.setattr(
+        nodes_mod, "get_structured_llm", lambda role, schema: FakeStructuredLLM(result=decision)
+    )
+
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.UNCERTAIN,
+        concept=None,
+        explanation="Attempt is completely ambiguous.",
+        evidence="???",
+        confidence=0.9,  # High confidence in being uncertain
+    )
+    state = _base_state(task_context, metadata, diagnosis=diagnosis)
+    update = nodes_mod.choose_intervention(state)
+
+    assert update["intervention"].type == InterventionType.CLARIFICATION
+    assert "category is UNCERTAIN" in update["intervention"].rationale
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,6 @@ import logging
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
-from ai.agents.coach.evidence import extract_evidence_candidates, extract_risk_signals
 from ai.agents.coach.schemas import DiagnosisResult, GeneratedResponse, InterventionDecision
 from ai.agents.coach.state import CoachState
 from ai.guardrails.coach_validator import final_answer_enforcement, validate_response
@@ -34,6 +33,14 @@ from ai.tools.student_history import StudentHistoryTool
 logger = logging.getLogger(__name__)
 
 MAX_CONVERSATION_MESSAGES = 8
+
+# Interventions that are safe to emit when diagnosis confidence is low or
+# the diagnosis category is UNCERTAIN.  All others are forced to CLARIFICATION
+# by the deterministic enforcement in choose_intervention().
+_UNCERTAIN_ALLOWED_INTERVENTIONS: frozenset[InterventionType] = frozenset({
+    InterventionType.CLARIFICATION,
+    InterventionType.QUESTION,
+})
 
 
 def _conversation_summary(messages: list[BaseMessage]) -> str:
@@ -184,6 +191,7 @@ def choose_intervention(state: CoachState) -> dict:
         diagnosis_category=diagnosis.category.value,
         diagnosis_concept=diagnosis.concept or "",
         diagnosis_explanation=diagnosis.explanation,
+        diagnosis_confidence=diagnosis.confidence,
         is_revision=is_revision,
         previous_intervention=prior_intervention.type.value if prior_intervention else "",
         turn_index=state["metadata"].turn_index,
@@ -218,6 +226,30 @@ def choose_intervention(state: CoachState) -> dict:
             "errors": errors,
         }
 
+    # ── Deterministic enforcement 1: UNCERTAIN category (Fix 3) ──────────
+    # If the diagnosis category is explicitly UNCERTAIN, force CLARIFICATION
+    # unconditionally — do not rely on the LLM to do this itself.
+    if diagnosis.category == DiagnosisCategory.UNCERTAIN:
+        intervention_type = InterventionType.CLARIFICATION
+        rationale += (
+            " (forced to CLARIFICATION: diagnosis category is UNCERTAIN.)"
+        )
+
+    # ── Deterministic enforcement 2: low-confidence diagnosis (Fix 2) ────
+    # If the diagnosis is uncertain due to low confidence (< 0.4) and the
+    # LLM chose something other than CLARIFICATION/QUESTION, downgrade it.
+    # This check is separate from the UNCERTAIN *category* check so both
+    # remain independently traceable in the rationale.
+    elif diagnosis.is_uncertain and intervention_type not in _UNCERTAIN_ALLOWED_INTERVENTIONS:
+        intervention_type = InterventionType.CLARIFICATION
+        rationale += (
+            " (forced to CLARIFICATION: diagnosis confidence is below the "
+            "uncertainty threshold — committing to a more directive intervention "
+            "would risk acting on an unreliable diagnosis.)"
+        )
+
+    # ── Deterministic enforcement 3: GUIDED policy on first attempt ───────
+    # (Existing logic — preserved unchanged.)
     # Code-level enforcement of the policy (section 23, ADR-006): critical
     # constraints are enforced here, not left to the prompt alone. On a first
     # attempt under GUIDED, an EXPLANATION is too close to giving away the
@@ -325,6 +357,7 @@ def validate(state: CoachState) -> dict:
     intervention = state["intervention"]
     draft = state.get("response") or ""
     course_material = _format_course_material(state.get("retrieved_context") or [])
+    is_programming = state["task_context"].is_programming
 
     result = validate_response(
         policy=policy,
@@ -333,13 +366,16 @@ def validate(state: CoachState) -> dict:
         intervention_type=intervention.type.value,
         course_material=course_material,
         draft_response=draft,
+        is_programming=is_programming,
     )
 
     update: dict = {"validation_passed": result.passes, "validation_violations": list(result.violations)}
 
     if result.passes:
         # Validation passed — but run deterministic enforcement as final check.
-        is_safe, enforced = final_answer_enforcement(draft)
+        is_safe, enforced = final_answer_enforcement(
+            draft, policy=policy, is_programming=is_programming
+        )
         if not is_safe:
             update["response"] = enforced
             update["validation_violations"] = list(result.violations) + [
@@ -349,7 +385,9 @@ def validate(state: CoachState) -> dict:
             update["validation_passed"] = True
     elif result.revised_response:
         # LLM proposed a rewrite.  Run deterministic enforcement on it.
-        is_safe, enforced = final_answer_enforcement(result.revised_response)
+        is_safe, enforced = final_answer_enforcement(
+            result.revised_response, policy=policy, is_programming=is_programming
+        )
         if is_safe:
             update["response"] = enforced
             update["validation_passed"] = True
@@ -396,18 +434,25 @@ def safe_fallback_response(state: CoachState) -> dict:
 
 def emit_interaction(state: CoachState) -> dict:
     response = state.get("response") or ""
+    policy = state["policy"]
+    is_programming = state["task_context"].is_programming
 
     # Absolute last-line defense: deterministic enforcement before the
     # response reaches the student.  This catches anything that slipped
     # through validation + LLM rewrite.
-    is_safe, enforced_response = final_answer_enforcement(response)
+    is_safe, enforced_response = final_answer_enforcement(
+        response, policy=policy, is_programming=is_programming
+    )
     if not is_safe:
         logger.warning("emit_interaction: final_answer_enforcement replaced the response.")
 
-    evidence_candidates = extract_evidence_candidates(state)
-    risk_signals = extract_risk_signals(state)
+    # IMPORTANT: `response` must be updated here too, not just the emitted
+    # AIMessage. Coach._to_result() reads state["response"] (not the
+    # message content) to build CoachResult/AIInteraction, so if this node
+    # ever actually replaces an unsafe response, that replacement must be
+    # reflected in the returned state or the API-facing response and the
+    # persisted AIInteraction would still carry the original unsafe text.
     return {
+        "response": enforced_response,
         "messages": [AIMessage(content=enforced_response)],
-        "evidence_candidates": evidence_candidates,
-        "risk_signals": risk_signals,
     }

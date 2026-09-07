@@ -332,12 +332,29 @@ class TestInvariantK_EmitInteractionEnforcement:
         update = nodes_mod.emit_interaction(state)
         # The emitted message must NOT contain the original answer
         assert "the answer is" not in update["messages"][0].content.lower()
+        # Regression (response-consistency bug): state["response"] must be
+        # replaced too, not just the emitted AIMessage -- otherwise
+        # CoachResult/AIInteraction (which read state["response"]) would
+        # still leak the original unsafe text even though the emitted
+        # message is safe.
+        assert "the answer is" not in update["response"].lower()
 
     def test_emit_passes_safe_response(self, task_context, metadata):
         safe = "What do you think would happen if you used a different learning rate?"
         state = _base_state(task_context, metadata, response=safe)
         update = nodes_mod.emit_interaction(state)
         assert update["messages"][0].content == safe
+        assert update["response"] == safe
+
+    def test_emitted_message_and_response_are_always_identical(self, task_context, metadata):
+        """The core response-consistency invariant (section 5/15): whatever
+        emit_interaction decides is safe must be the same string in both
+        the emitted AIMessage and the state["response"] field, for both
+        the safe and unsafe cases."""
+        for draft in ("The answer is 42.", "What led you to that conclusion?"):
+            state = _base_state(task_context, metadata, response=draft)
+            update = nodes_mod.emit_interaction(state)
+            assert update["messages"][0].content == update["response"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -461,3 +478,180 @@ class TestInvariantP_NoCheatingClaims:
             assert "cheat" not in signal.observation.lower()
             assert "ai-generated" not in signal.observation.lower()
             assert "used chatgpt" not in signal.observation.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# INVARIANT Q: Structural Code-Leak Detection (Phrase-free complete solutions)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestInvariantQ_StructuralCodeLeak:
+    """Regression tests for FIX 1: Structural code-leak detector.
+
+    Ensures that complete programming solutions are blocked even when they
+    deliberately omit answer-revealing phrases, while legitimate instructional
+    snippets, small examples, and partial demonstrations remain allowed.
+    """
+
+    COMPLETE_PHRASE_FREE_SOLUTION = (
+        "Take a look at how this can be implemented:\n\n"
+        "```python\n"
+        "def linear_regression_gradient_descent(X, y, lr=0.01, epochs=1000):\n"
+        "    m = len(y)\n"
+        "    theta = np.zeros(X.shape[1])\n"
+        "    for epoch in range(epochs):\n"
+        "        predictions = np.dot(X, theta)\n"
+        "        errors = predictions - y\n"
+        "        gradient = (1 / m) * np.dot(X.T, errors)\n"
+        "        theta = theta - lr * gradient\n"
+        "    cost = (1 / (2 * m)) * np.sum(errors ** 2)\n"
+        "    return theta, cost\n"
+        "```\n\n"
+        "How does that align with your understanding?"
+    )
+
+    LEGITIMATE_INSTRUCTIONAL_SNIPPET = (
+        "Here is a conceptual example of a loss calculation function:\n\n"
+        "```python\n"
+        "def calculate_loss(y_true, prediction):\n"
+        "    return y_true - prediction\n"
+        "```\n\n"
+        "How would you integrate this into your update step?"
+    )
+
+    LEGITIMATE_LOOP_SNIPPET = (
+        "Consider how a simple loop iterates over values:\n\n"
+        "```python\n"
+        "for step in range(3):\n"
+        "    print(step)\n"
+        "```\n\n"
+        "What condition controls how many steps your model should take?"
+    )
+
+    COMPLETE_MULTI_FUNCTION_SOLUTION = (
+        "Here is how both functions work together:\n\n"
+        "```python\n"
+        "def compute_cost(X, y, theta):\n"
+        "    m = len(y)\n"
+        "    diff = np.dot(X, theta) - y\n"
+        "    return (1 / (2 * m)) * np.sum(diff ** 2)\n\n"
+        "def gradient_descent(X, y, theta, lr=0.01, epochs=1000):\n"
+        "    m = len(y)\n"
+        "    for epoch in range(epochs):\n"
+        "        grad = (1 / m) * np.dot(X.T, (np.dot(X, theta) - y))\n"
+        "        theta = theta - lr * grad\n"
+        "    return theta\n"
+        "```\n"
+    )
+
+    def test_a_phrase_free_complete_solution_blocked(self, task_context, metadata):
+        """Test A: A syntactically valid, complete solution with no red-flag phrases
+        is detected as a structural leak and prevented from emission."""
+        task_context.is_programming = True
+        state = _base_state(
+            task_context,
+            metadata,
+            policy=AssistancePolicy.GUIDED,
+            response=self.COMPLETE_PHRASE_FREE_SOLUTION,
+        )
+
+        # Rule-based check flags it directly
+        violations = rule_based_check(
+            policy=AssistancePolicy.GUIDED,
+            draft_response=self.COMPLETE_PHRASE_FREE_SOLUTION,
+            is_programming=True,
+        )
+        assert violations, "Expected structural leak violation for phrase-free complete solution."
+        assert any("structural" in v.lower() for v in violations)
+
+        # In validate node, the response is replaced or fails
+        update = nodes_mod.validate(state)
+        emitted_text = update.get("response", "")
+        assert "def linear_regression_gradient_descent" not in emitted_text
+
+    def test_b_legitimate_instructional_code_not_overblocked(self):
+        """Test B: Small or partial educational examples must NOT be blocked merely
+        because they contain valid syntax, a function, or multiple lines."""
+        for policy in list(AssistancePolicy):
+            # Function snippet without loop/multiple variables
+            violations = rule_based_check(
+                policy=policy,
+                draft_response=self.LEGITIMATE_INSTRUCTIONAL_SNIPPET,
+                is_programming=True,
+            )
+            assert not violations, f"Legitimate function snippet overblocked under {policy.value}"
+
+            # Simple loop snippet without function
+            violations_loop = rule_based_check(
+                policy=policy,
+                draft_response=self.LEGITIMATE_LOOP_SNIPPET,
+                is_programming=True,
+            )
+            assert not violations_loop, f"Legitimate loop snippet overblocked under {policy.value}"
+
+    def test_c_policy_coverage_guided_assisted_and_open(self):
+        """Test C: Guided and Assisted block complete solutions. Open still cannot
+        return a complete assignment solution (multi-function implementation),
+        while legitimate partial examples pass under Open."""
+        # GUIDED blocks complete solution
+        v_guided = rule_based_check(
+            policy=AssistancePolicy.GUIDED,
+            draft_response=self.COMPLETE_PHRASE_FREE_SOLUTION,
+            is_programming=True,
+        )
+        assert v_guided
+
+        # ASSISTED blocks complete solution
+        v_assisted = rule_based_check(
+            policy=AssistancePolicy.ASSISTED,
+            draft_response=self.COMPLETE_PHRASE_FREE_SOLUTION,
+            is_programming=True,
+        )
+        assert v_assisted
+
+        # OPEN blocks multi-function complete assignment solution
+        v_open = rule_based_check(
+            policy=AssistancePolicy.OPEN,
+            draft_response=self.COMPLETE_MULTI_FUNCTION_SOLUTION,
+            is_programming=True,
+        )
+        assert v_open, "OPEN policy must block complete multi-function assignment solution."
+
+        # OPEN allows single-function instructional demo that does not meet the higher Open threshold
+        open_demo = (
+            "Here is how a step logging loop works:\n\n"
+            "```python\n"
+            "def log_step(epoch, loss):\n"
+            "    for i in range(epoch):\n"
+            "        msg = f'Epoch {i}: {loss}'\n"
+            "```"
+        )
+        v_open_demo = rule_based_check(
+            policy=AssistancePolicy.OPEN,
+            draft_response=open_demo,
+            is_programming=True,
+        )
+        assert not v_open_demo, "OPEN policy should allow partial single-function pedagogical demo."
+
+    def test_d_final_enforcement_path_catches_structural_leak(self, task_context, metadata):
+        """Test D: The structural protection survives the final enforcement/emission
+        stage even if earlier stages were bypassed."""
+        task_context.is_programming = True
+        is_safe, enforced = final_answer_enforcement(
+            self.COMPLETE_PHRASE_FREE_SOLUTION,
+            policy=AssistancePolicy.GUIDED,
+            is_programming=True,
+        )
+        assert not is_safe, "final_answer_enforcement must block phrase-free complete solution."
+        assert "def linear_regression_gradient_descent" not in enforced
+
+        # Test emit_interaction node
+        state = _base_state(
+            task_context,
+            metadata,
+            policy=AssistancePolicy.GUIDED,
+            response=self.COMPLETE_PHRASE_FREE_SOLUTION,
+        )
+        result = nodes_mod.emit_interaction(state)
+        assert "def linear_regression_gradient_descent" not in result["response"]
+        assert "def linear_regression_gradient_descent" not in result["messages"][0].content
+        assert result["response"] == result["messages"][0].content

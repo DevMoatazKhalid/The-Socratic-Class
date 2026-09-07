@@ -172,3 +172,122 @@ def test_three_turn_student_learning_progression(monkeypatch, task_context):
     evidence_types_3 = [e.evidence_type for e in result3.evidence_candidates]
     assert EvidenceType.UNDERSTANDING in evidence_types_3
     assert EvidenceType.REVISION in evidence_types_3
+
+
+def test_prior_diagnosis_and_intervention_reach_turn_two_prompts(monkeypatch, task_context):
+    """Regression: Coach.invoke() previously hardcoded diagnosis=None and
+    intervention=None into initial_state on every call, so the "prior
+    diagnosis" / "previous intervention" context that diagnose() and
+    choose_intervention() build for their prompts was always empty --
+    even on revision turns. Passing prior_diagnosis/prior_intervention
+    into Coach.invoke() must make that context actually appear in the
+    turn-2 prompts."""
+    diagnosis_calls: list[list] = []
+    intervention_calls: list[list] = []
+
+    turn1_diagnosis = DiagnosisResult(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="gradient_descent",
+        explanation="Updates parameters directly by raw prediction error.",
+        evidence="theta = theta - prediction",
+        confidence=0.8,
+    )
+    turn2_diagnosis = DiagnosisResult(
+        category=DiagnosisCategory.MISCONCEPTION,
+        concept="learning_rate",
+        explanation="Now uses gradient, but missing learning rate scaling.",
+        evidence="theta = theta - gradient",
+        confidence=0.85,
+    )
+    diagnoses = iter([turn1_diagnosis, turn2_diagnosis])
+
+    turn1_intervention = InterventionDecision(
+        intervention_type=InterventionType.QUESTION,
+        rationale="Prompt student to think about the direction of steepest descent.",
+    )
+    turn2_intervention = InterventionDecision(
+        intervention_type=InterventionType.HINT,
+        rationale="Hint about step-size control.",
+    )
+    interventions = iter([turn1_intervention, turn2_intervention])
+
+    responses = iter(
+        [
+            GeneratedResponse(
+                response="What vector points toward steepest ascent of the loss?",
+                referenced_concepts=["gradient"],
+            ),
+            GeneratedResponse(
+                response="Good, you have the gradient! What controls the size of each step?",
+                referenced_concepts=["learning_rate"],
+            ),
+        ]
+    )
+
+    def fake_get_structured_llm(role, schema):
+        if schema is DiagnosisResult:
+            def _diag(messages):
+                diagnosis_calls.append(messages)
+                return next(diagnoses)
+            return FakeStructuredLLM(side_effect=_diag)
+        if schema is InterventionDecision:
+            def _interv(messages):
+                intervention_calls.append(messages)
+                return next(interventions)
+            return FakeStructuredLLM(side_effect=_interv)
+        if schema is GeneratedResponse:
+            return FakeStructuredLLM(side_effect=lambda m: next(responses))
+        raise AssertionError(schema)
+
+    monkeypatch.setattr(nodes_mod, "get_structured_llm", fake_get_structured_llm)
+    monkeypatch.setattr(
+        nodes_mod,
+        "validate_response",
+        lambda **kwargs: ValidationResult(passes=True, violations=[]),
+    )
+
+    coach = Coach()
+    conversation = []
+
+    result1 = coach.invoke(
+        student_id="student_bob",
+        assignment_id="asg_gd",
+        session_id="sess_123",
+        task_context=task_context,
+        attempt="theta = theta - prediction",
+        policy=AssistancePolicy.GUIDED,
+        conversation=conversation,
+        turn_index=0,
+    )
+    conversation.append(HumanMessage(content="theta = theta - prediction"))
+    conversation.append(AIMessage(content=result1.response))
+
+    # Turn 1 has no prior diagnosis/intervention -- the prompts should say so.
+    turn1_diag_prompt = "\n".join(m.content for m in diagnosis_calls[0])
+    assert "(none)" in turn1_diag_prompt
+    turn1_interv_prompt = "\n".join(m.content for m in intervention_calls[0])
+    assert "(none, first turn)" in turn1_interv_prompt
+
+    # Turn 2: caller passes turn 1's diagnosis/intervention back in, exactly
+    # as a backend would using the previous CoachResult.
+    coach.invoke(
+        student_id="student_bob",
+        assignment_id="asg_gd",
+        session_id="sess_123",
+        task_context=task_context,
+        attempt="theta = theta - gradient",
+        message="I changed it to use the gradient",
+        policy=AssistancePolicy.GUIDED,
+        conversation=conversation,
+        turn_index=1,
+        prior_diagnosis=result1.diagnosis_summary,
+        prior_intervention=result1.intervention,
+    )
+
+    turn2_diag_prompt = "\n".join(m.content for m in diagnosis_calls[1])
+    assert "gradient_descent" in turn2_diag_prompt
+    assert "MISCONCEPTION" in turn2_diag_prompt
+
+    turn2_interv_prompt = "\n".join(m.content for m in intervention_calls[1])
+    assert "QUESTION" in turn2_interv_prompt
+    assert "(none, first turn)" not in turn2_interv_prompt
