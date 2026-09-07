@@ -89,7 +89,7 @@ All tools are injectable constructor arguments to `Coach(...)`:
   Returns bounded prior learning events. Never loads full longitudinal profiles into state.
 - **`AssignmentContextTool`** (`ai/tools/assignment_context.py`):
   `.get(assignment_id) -> Optional[TaskContext]`.
-  Fallback interface for fetching assignment context when not passed in the request path.
+  Ready interface for fetching assignment context. *Note: `AssignmentContextTool` is currently not wired into an active Coach call path; assignment/task context is supplied directly through `TaskContext` on each invocation.*
 - **`CodeAnalysisTool`** (`ai/tools/code_analysis.py`):
   `.analyze(code, language="python") -> CodeAnalysisResult`.
   Static Python AST analysis only (syntax validity, defined functions, variables, loop count). Does **not** execute student code. Explicitly sets `is_supported_language=False` for non-Python attempts.
