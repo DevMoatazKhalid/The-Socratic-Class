@@ -434,6 +434,201 @@ def test_generate_response_handles_llm_failure_gracefully(monkeypatch, task_cont
 
 
 # ---------------------------------------------------------------------------
+# P1 #8: validation-aware retry
+# ---------------------------------------------------------------------------
+
+def test_generate_response_passes_no_violations_on_first_attempt(monkeypatch, task_context, metadata):
+    """retry_count == 0 (first attempt): the generator must not receive any
+    'previous draft was rejected' framing, since there was no previous draft."""
+    captured = {}
+
+    def fake_build_response_messages(**kwargs):
+        captured.update(kwargs)
+        return [HumanMessage(content="prompt")]
+
+    monkeypatch.setattr(nodes_mod, "build_response_messages", fake_build_response_messages)
+    monkeypatch.setattr(
+        nodes_mod,
+        "get_structured_llm",
+        lambda role, schema: FakeStructuredLLM(
+            result=GeneratedResponse(response="ok", referenced_concepts=[])
+        ),
+    )
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION, concept="learning_rate",
+        explanation="e", evidence="ev", confidence=0.7,
+    )
+    from ai.models.schemas import Intervention
+
+    intervention = Intervention(
+        type=InterventionType.QUESTION, assistance_level=AssistancePolicy.GUIDED, rationale="probe"
+    )
+    state = _base_state(
+        task_context, metadata, diagnosis=diagnosis, intervention=intervention,
+        retry_count=0, validation_violations=["should be ignored on first attempt"],
+    )
+    nodes_mod.generate_response(state)
+    assert captured["previous_violations"] is None
+
+
+def test_generate_response_passes_violations_on_retry(monkeypatch, task_context, metadata):
+    """On retry (retry_count > 0), the generator must receive the stored
+    validation_violations from the failed first attempt, so it can avoid
+    repeating the same mistake."""
+    captured = {}
+
+    def fake_build_response_messages(**kwargs):
+        captured.update(kwargs)
+        return [HumanMessage(content="prompt")]
+
+    monkeypatch.setattr(nodes_mod, "build_response_messages", fake_build_response_messages)
+    monkeypatch.setattr(
+        nodes_mod,
+        "get_structured_llm",
+        lambda role, schema: FakeStructuredLLM(
+            result=GeneratedResponse(response="ok", referenced_concepts=[])
+        ),
+    )
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION, concept="learning_rate",
+        explanation="e", evidence="ev", confidence=0.7,
+    )
+    from ai.models.schemas import Intervention
+
+    intervention = Intervention(
+        type=InterventionType.QUESTION, assistance_level=AssistancePolicy.GUIDED, rationale="probe"
+    )
+    violations = ["Response revealed a complete final answer."]
+    state = _base_state(
+        task_context, metadata, diagnosis=diagnosis, intervention=intervention,
+        retry_count=1, validation_violations=violations,
+    )
+    nodes_mod.generate_response(state)
+    assert captured["previous_violations"] == violations
+
+
+def test_build_response_messages_embeds_violation_note_for_generator_only():
+    """The retry note must be present in the generator-facing prompt, phrased
+    as pipeline-internal guidance, and explicitly instruct the model never to
+    surface it to the student."""
+    from ai.prompts.coach.response_prompt import build_response_messages
+
+    messages = build_response_messages(
+        policy="GUIDED",
+        intervention_type="question",
+        diagnosis_category="misconception",
+        diagnosis_concept="learning_rate",
+        course_material="",
+        conversation_summary="",
+        current_attempt="theta = theta - grad",
+        previous_violations=["Draft contained the complete corrected code."],
+    )
+    human_content = messages[1].content
+    assert "Your previous draft was rejected because" in human_content
+    assert "Draft contained the complete corrected code." in human_content
+    assert "must never be mentioned" in human_content
+
+
+def test_build_response_messages_omits_violation_note_when_none_given():
+    from ai.prompts.coach.response_prompt import build_response_messages
+
+    messages = build_response_messages(
+        policy="GUIDED",
+        intervention_type="question",
+        diagnosis_category="misconception",
+        diagnosis_concept="learning_rate",
+        course_material="",
+        conversation_summary="",
+        current_attempt="theta = theta - grad",
+    )
+    human_content = messages[1].content
+    assert "Your previous draft was rejected" not in human_content
+
+
+def test_full_retry_cycle_fails_then_retries_with_violations_then_enforces_and_falls_back(
+    monkeypatch, task_context, metadata
+):
+    """End-to-end regression for the full validation-aware retry flow:
+    1. first generation fails validation
+    2. the violation is stored in state
+    3. the second generation call receives that violation via
+       build_response_messages(previous_violations=...)
+    4. deterministic final_answer_enforcement still runs on the retried draft
+    5. if the retried draft still fails, safe_fallback_response still works
+    """
+    from ai.agents.coach import routing as routing_mod
+    from ai.guardrails import coach_validator as validator_mod
+    from ai.models.schemas import Intervention
+
+    diagnosis = Diagnosis(
+        category=DiagnosisCategory.MISCONCEPTION, concept="learning_rate",
+        explanation="e", evidence="ev", confidence=0.7,
+    )
+    intervention = Intervention(
+        type=InterventionType.QUESTION, assistance_level=AssistancePolicy.GUIDED, rationale="probe"
+    )
+
+    captured_calls = []
+
+    def fake_build_response_messages(**kwargs):
+        captured_calls.append(kwargs)
+        return [HumanMessage(content="prompt")]
+
+    monkeypatch.setattr(nodes_mod, "build_response_messages", fake_build_response_messages)
+
+    # First draft "reveals the final answer" (unsafe); second draft is safe.
+    responses = [
+        GeneratedResponse(response="The final answer is theta=0.5.", referenced_concepts=[]),
+        GeneratedResponse(response="What term scales the gradient step?", referenced_concepts=[]),
+    ]
+    call_index = {"n": 0}
+
+    class SequencedFakeLLM:
+        def invoke(self, messages):
+            result = responses[call_index["n"]]
+            call_index["n"] += 1
+            return result
+
+    monkeypatch.setattr(nodes_mod, "get_structured_llm", lambda role, schema: SequencedFakeLLM())
+
+    # 1. First generation.
+    state = _base_state(task_context, metadata, diagnosis=diagnosis, intervention=intervention)
+    gen_update_1 = nodes_mod.generate_response(state)
+    state.update(gen_update_1)
+    assert captured_calls[0]["previous_violations"] is None
+
+    # Validate (real validator + guardrails) -- expect it to fail and flag a
+    # violation, incrementing retry_count.
+    validate_update_1 = nodes_mod.validate(state)
+    state.update(validate_update_1)
+    assert state["retry_count"] == 1
+    # 2. The violation must be stored in state for the retry to consume.
+    assert state["validation_violations"], "Expected a stored violation after first failure"
+
+    # Router must send us back to generate_response, not straight to fallback.
+    assert routing_mod.route_after_validation(state) == "generate_response"
+
+    # 3. Second generation call must receive the stored violation.
+    gen_update_2 = nodes_mod.generate_response(state)
+    state.update(gen_update_2)
+    assert captured_calls[1]["previous_violations"] == validate_update_1["validation_violations"]
+
+    # 4. Deterministic enforcement still runs on the retried draft via validate().
+    validate_update_2 = nodes_mod.validate(state)
+    state.update(validate_update_2)
+    assert state["validation_passed"] is True
+
+    # 5. Fallback path still works if retries are exhausted.
+    exhausted_state = dict(state)
+    exhausted_state["validation_passed"] = False
+    exhausted_state["retry_count"] = routing_mod.MAX_VALIDATION_RETRIES + 1
+    assert routing_mod.route_after_validation(exhausted_state) == "safe_fallback"
+    fallback_update = nodes_mod.safe_fallback_response(exhausted_state)
+    assert fallback_update["validation_passed"] is True
+    assert fallback_update["response"]
+
+
+# ---------------------------------------------------------------------------
 # emit_interaction
 # ---------------------------------------------------------------------------
 

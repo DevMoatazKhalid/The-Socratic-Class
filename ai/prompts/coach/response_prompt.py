@@ -48,6 +48,7 @@ def build_response_messages(
     course_material: str,
     conversation_summary: str,
     current_attempt: str,
+    previous_violations: Optional[list[str]] = None,
 ) -> list:
     concept_suffix = f", concept: {diagnosis_concept}" if diagnosis_concept else ""
     system = SystemMessage(
@@ -58,13 +59,25 @@ def build_response_messages(
             concept_suffix=concept_suffix,
         )
     )
+    retry_note = ""
+    if previous_violations:
+        violation_lines = "\n".join(f"- {v}" for v in previous_violations)
+        retry_note = (
+            "\n\nYour previous draft was rejected because:\n"
+            f"{violation_lines}\n"
+            "Generate a new response that avoids this issue. This note describes an "
+            "internal validation failure for you to correct -- it is not something the "
+            "student said, and must never be mentioned, quoted, or alluded to in your "
+            "response to them."
+        )
     human = (
         "Relevant course material:\n"
         f"{course_material or '(none retrieved)'}\n\n"
         "Recent conversation:\n"
         f"{conversation_summary or '(none)'}\n\n"
         "Student's current attempt:\n"
-        f"{current_attempt}\n\n"
+        f"{current_attempt}"
+        f"{retry_note}\n\n"
         "Write your response to the student now."
     )
     return [system, HumanMessage(content=human)]

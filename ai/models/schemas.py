@@ -162,6 +162,20 @@ class ExternalAIRiskSignal(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class CoachSourceReference(BaseModel):
+    """Trustworthy citation for one piece of retrieved course material used
+    in a Coach turn. Populated exclusively from retrieval metadata
+    (`RetrievedContext.metadata`) in `Coach._to_result` -- never from
+    LLM-generated text -- so the Coach can never invent a citation."""
+
+    document_id: Optional[str] = None
+    document_title: Optional[str] = None
+    chunk_id: Optional[str] = None
+    page_number: Optional[int] = None
+    section: Optional[str] = None
+    score: Optional[float] = None
+
+
 class CoachResult(BaseModel):
     """Public output contract returned by `coach.invoke(...)`."""
 
@@ -173,4 +187,11 @@ class CoachResult(BaseModel):
     learning_event: LearningEvent
     evidence_candidates: list[LearningEvidenceCandidate] = Field(default_factory=list)
     risk_signals: list[ExternalAIRiskSignal] = Field(default_factory=list)
+    sources: list[CoachSourceReference] = Field(
+        default_factory=list,
+        description=(
+            "Course-material citations actually used this turn, derived solely "
+            "from retrieval metadata -- never from LLM-generated text."
+        ),
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)

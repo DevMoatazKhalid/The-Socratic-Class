@@ -30,7 +30,26 @@ def test_course_retrieval_filters_out_other_courses():
     assert strict_sources == {"lecture1"}
 
 
-def test_course_retrieval_handles_malformed_metadata():
+def test_course_retrieval_forwards_student_context_when_supported():
+    captured = {}
+
+    def context_aware_retriever(course_id, query, top_k=4, student_context=None):
+        captured["student_context"] = student_context
+        return []
+
+    tool = CourseRetrievalTool(retriever=context_aware_retriever)
+    tool.retrieve("course_a", "q", student_context={"message": "why is this wrong?"})
+    assert captured["student_context"] == {"message": "why is this wrong?"}
+
+
+def test_course_retrieval_tolerates_retriever_without_student_context_support():
+    def legacy_retriever(course_id, query, top_k=4):
+        return [RetrievedContext(source="ok", content="ok", metadata={"course_id": "course_a"})]
+
+    tool = CourseRetrievalTool(retriever=legacy_retriever)
+    # Must not raise even though legacy_retriever has no student_context param.
+    results = tool.retrieve("course_a", "q", student_context={"message": "hi"})
+    assert [r.source for r in results] == ["ok"]
     def malformed_retriever(course_id, query, top_k=4):
         return [
             RetrievedContext(source="valid", content="ok", metadata={"course_id": "course_a"}),
