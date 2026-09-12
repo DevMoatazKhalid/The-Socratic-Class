@@ -11,7 +11,7 @@ from typing import Annotated, Any, Optional
 
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
 
 from ai.models.schemas import (
@@ -26,7 +26,11 @@ from ai.tools.code_analysis import CodeAnalysisResult
 
 
 class TaskContext(BaseModel):
-    """Static context about the assignment the student is working on."""
+    """Static context about the assignment the student is working on.
+
+    Tenant scoping fields (university_id, classroom_id, allowed_document_ids)
+    are populated exclusively by trusted backend session authorization.
+    """
 
     assignment_id: str
     course_id: str
@@ -34,6 +38,10 @@ class TaskContext(BaseModel):
     instructions: str
     subject_area: Optional[str] = None
     is_programming: bool = False
+    # Supplied by trusted backend/session authorization, never student text.
+    university_id: Optional[str] = None
+    classroom_id: Optional[str] = None
+    allowed_document_ids: list[str] = Field(default_factory=list)
 
 
 class InteractionMetadata(BaseModel):

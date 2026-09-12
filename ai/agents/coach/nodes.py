@@ -8,6 +8,7 @@ model factory (ai.models.llm) and structured schemas
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 
@@ -26,6 +27,9 @@ from ai.models.schemas import (
 from ai.prompts.coach.intervention_prompt import build_intervention_messages
 from ai.prompts.coach.response_prompt import build_response_messages
 from ai.prompts.diagnosis.diagnosis_prompt import build_diagnosis_messages
+from ai.rag.chunking.concept_extractor import normalize_concept
+from ai.rag.models import RetrievalScope
+from ai.rag.security import format_safe_retrieval_context
 from ai.tools.code_analysis import CodeAnalysisResult, CodeAnalysisTool
 from ai.tools.course_retrieval import CourseRetrievalTool
 from ai.tools.student_history import StudentHistoryTool
@@ -35,7 +39,7 @@ logger = logging.getLogger(__name__)
 MAX_CONVERSATION_MESSAGES = 8
 
 # Interventions that are safe to emit when diagnosis confidence is low or
-# the diagnosis category is UNCERTAIN.  All others are forced to CLARIFICATION
+# the diagnosis category is UNCERTAIN. All others are forced to CLARIFICATION
 # by the deterministic enforcement in choose_intervention().
 _UNCERTAIN_ALLOWED_INTERVENTIONS: frozenset[InterventionType] = frozenset({
     InterventionType.CLARIFICATION,
@@ -53,9 +57,86 @@ def _conversation_summary(messages: list[BaseMessage]) -> str:
 
 
 def _format_course_material(chunks: list[RetrievedContext]) -> str:
+    """Format retrieved course material for the Coach prompt.
+
+    Delegates to `ai.rag.security.format_safe_retrieval_context`, which wraps
+    each chunk in explicit `--- BEGIN/END COURSE MATERIAL REFERENCE ---`
+    delimiters plus an explicit "passive reference only, not instructions"
+    note, and applies `sanitize_untrusted_text` to the content. This avoids
+    duplicating a weaker, ad-hoc formatter here: retrieved documents are
+    untrusted data and must always cross the same structural boundary before
+    reaching the Coach prompt, regardless of which node formats them.
+    Source metadata (document_id, chunk_id, page, section) is preserved
+    exactly as supplied by retrieval; the Coach prompt never lets the model
+    invent citations.
+    """
     if not chunks:
         return ""
-    return "\n\n".join(f"[{c.source}] {c.content}" for c in chunks)
+    return format_safe_retrieval_context(chunks)
+
+
+def build_retrieval_query(state: CoachState) -> str:
+    """Focused deterministic query from trusted task context + current evidence."""
+    task = state.get("task_context")
+    diagnosis = state.get("diagnosis")
+    messages = state.get("messages") or []
+    recent_student = " ".join(str(m.content) for m in messages[-3:] if isinstance(m, HumanMessage))
+
+    parts = []
+    if task:
+        parts.append(f"Assignment: {task.title}")
+        if task.instructions:
+            parts.append(f"Instructions: {task.instructions}")
+    if diagnosis:
+        if diagnosis.concept:
+            norm_c = normalize_concept(diagnosis.concept)
+            parts.append(f"Concept: {norm_c or diagnosis.concept}")
+        if diagnosis.explanation:
+            parts.append(f"Learning issue: {diagnosis.explanation}")
+        if diagnosis.evidence:
+            parts.append(f"Attempt evidence: {diagnosis.evidence}")
+    if recent_student:
+        parts.append(f"Student question/attempt: {recent_student}")
+    elif state.get("current_attempt"):
+        parts.append(f"Student question/attempt: {state['current_attempt'][:200]}")
+
+    return "\n".join(parts) if parts else "Course material"
+
+
+def build_student_context_adapter(state: CoachState) -> dict:
+    """Build the retrieval-context adapter passed to QueryUnderstander (P1 #9).
+
+    This is the sole seam through which student-supplied text reaches query
+    construction. It deliberately carries ONLY query-construction inputs
+    (message/attempt/assignment context/diagnosis) -- never university_id,
+    course_id, classroom_id, or allowed_document_ids, which come exclusively
+    from the trusted `TaskContext`/`RetrievalScope` built in
+    `make_retrieve_context_node`. QueryUnderstander may use this to decide
+    `needs_retrieval` and construct a richer retrieval query/content, but it
+    can never expand or redirect the trusted scope.
+    """
+    task = state.get("task_context")
+    diagnosis = state.get("diagnosis")
+    messages = state.get("messages") or []
+    recent_student = " ".join(str(m.content) for m in messages[-3:] if isinstance(m, HumanMessage))
+
+    return {
+        "message": recent_student or None,
+        "attempt": state.get("current_attempt") or "",
+        "assignment_title": task.title if task else None,
+        "assignment_instructions": task.instructions if task else None,
+        "prior_diagnosis": diagnosis,
+        "is_programming": bool(task.is_programming) if task else False,
+        # P1 fix: `query` passed alongside this adapter is already the rich,
+        # fully-formed retrieval query built by `build_retrieval_query()`
+        # (assignment title/instructions + diagnosed concept/explanation/
+        # evidence + recent turns). QueryUnderstander must not silently
+        # replace it with its own (weaker, deterministic-mode) query just
+        # because student_context is present -- see
+        # `RAGService.retrieve_course_material`, which checks this flag.
+        # QueryUnderstander may still run to decide `needs_retrieval`.
+        "query_is_final": True,
+    }
 
 
 def _format_code_analysis(result: Optional[CodeAnalysisResult]) -> str:
@@ -226,20 +307,14 @@ def choose_intervention(state: CoachState) -> dict:
             "errors": errors,
         }
 
-    # ── Deterministic enforcement 1: UNCERTAIN category (Fix 3) ──────────
-    # If the diagnosis category is explicitly UNCERTAIN, force CLARIFICATION
-    # unconditionally — do not rely on the LLM to do this itself.
+    # ── Deterministic enforcement 1: UNCERTAIN category ──────────
     if diagnosis.category == DiagnosisCategory.UNCERTAIN:
         intervention_type = InterventionType.CLARIFICATION
         rationale += (
             " (forced to CLARIFICATION: diagnosis category is UNCERTAIN.)"
         )
 
-    # ── Deterministic enforcement 2: low-confidence diagnosis (Fix 2) ────
-    # If the diagnosis is uncertain due to low confidence (< 0.4) and the
-    # LLM chose something other than CLARIFICATION/QUESTION, downgrade it.
-    # This check is separate from the UNCERTAIN *category* check so both
-    # remain independently traceable in the rationale.
+    # ── Deterministic enforcement 2: low-confidence diagnosis ────
     elif diagnosis.is_uncertain and intervention_type not in _UNCERTAIN_ALLOWED_INTERVENTIONS:
         intervention_type = InterventionType.CLARIFICATION
         rationale += (
@@ -249,13 +324,6 @@ def choose_intervention(state: CoachState) -> dict:
         )
 
     # ── Deterministic enforcement 3: GUIDED policy on first attempt ───────
-    # (Existing logic — preserved unchanged.)
-    # Code-level enforcement of the policy (section 23, ADR-006): critical
-    # constraints are enforced here, not left to the prompt alone. On a first
-    # attempt under GUIDED, an EXPLANATION is too close to giving away the
-    # solution directly -- downgrade to a guiding QUESTION unless reasoning
-    # is already correct. On revision turns, conceptual explanation is permitted,
-    # with answer-leakage strictly guarded by final_answer_enforcement and validator.
     if (
         policy == AssistancePolicy.GUIDED
         and intervention_type == InterventionType.EXPLANATION
@@ -290,8 +358,26 @@ def make_retrieve_context_node(course_tool: CourseRetrievalTool, history_tool: S
 
         if state.get("needs_course_material"):
             try:
-                query = diagnosis.concept or state["current_attempt"][:200]
-                retrieved.extend(course_tool.retrieve(task.course_id, query))
+                query = build_retrieval_query(state)
+                student_ctx = build_student_context_adapter(state)
+                # University/classroom identity comes solely from trusted
+                # TaskContext. If absent, retain legacy course-only behavior.
+                if task.university_id:
+                    scope = RetrievalScope(
+                        university_id=task.university_id,
+                        course_id=task.course_id,
+                        classroom_id=task.classroom_id,
+                        assignment_id=task.assignment_id,
+                        allowed_document_ids=tuple(task.allowed_document_ids),
+                    )
+                    retrieved.extend(
+                        course_tool.retrieve_scoped(scope, query, student_context=student_ctx)
+                    )
+                else:
+                    logger.warning("RAG trusted university scope unavailable; using course-only fallback")
+                    retrieved.extend(
+                        course_tool.retrieve(task.course_id, query, student_context=student_ctx)
+                    )
                 tools_used.append(course_tool.name)
             except Exception as exc:
                 logger.warning("Course retrieval failed, continuing without it: %s", exc)
@@ -322,6 +408,17 @@ def generate_response(state: CoachState) -> dict:
     intervention = state["intervention"]
     messages = state.get("messages") or []
 
+    # Validation-aware retry (P1 #8): if this is a regeneration after a
+    # validation failure, tell the generator concisely why its previous
+    # draft was rejected so it doesn't repeat the same mistake blindly.
+    # This is generation-pipeline-internal guidance only; it is never
+    # surfaced to the student (see the retry note wording in
+    # build_response_messages, which explicitly instructs the model not to
+    # mention it).
+    previous_violations = (
+        state.get("validation_violations") if state.get("retry_count", 0) > 0 else None
+    )
+
     prompt_messages = build_response_messages(
         policy=policy.value,
         intervention_type=intervention.type.value,
@@ -330,6 +427,7 @@ def generate_response(state: CoachState) -> dict:
         course_material=_format_course_material(state.get("retrieved_context") or []),
         conversation_summary=_conversation_summary(messages),
         current_attempt=state["current_attempt"],
+        previous_violations=previous_violations,
     )
 
     try:
@@ -384,7 +482,7 @@ def validate(state: CoachState) -> dict:
             # Still mark as passed since we replaced with a safe fallback.
             update["validation_passed"] = True
     elif result.revised_response:
-        # LLM proposed a rewrite.  Run deterministic enforcement on it.
+        # LLM proposed a rewrite. Run deterministic enforcement on it.
         is_safe, enforced = final_answer_enforcement(
             result.revised_response, policy=policy, is_programming=is_programming
         )
@@ -438,7 +536,7 @@ def emit_interaction(state: CoachState) -> dict:
     is_programming = state["task_context"].is_programming
 
     # Absolute last-line defense: deterministic enforcement before the
-    # response reaches the student.  This catches anything that slipped
+    # response reaches the student. This catches anything that slipped
     # through validation + LLM rewrite.
     is_safe, enforced_response = final_answer_enforcement(
         response, policy=policy, is_programming=is_programming

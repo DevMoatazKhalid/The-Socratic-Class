@@ -35,6 +35,7 @@ from ai.models.schemas import (
     AIInteraction,
     AssistancePolicy,
     CoachResult,
+    CoachSourceReference,
     Diagnosis,
     Intervention,
     LearningEvent,
@@ -184,6 +185,60 @@ class Coach:
         return self._to_result(final_state)
 
     @staticmethod
+    def _extract_sources(state: CoachState) -> list[CoachSourceReference]:
+        """Build trustworthy source citations from retrieval metadata only.
+
+        Deliberately reads `RetrievedContext.metadata` (populated upstream by
+        RAGService/CourseRetrievalTool from actual retrieval results) and
+        never touches LLM output, so the Coach can never surface a citation
+        the model invented. Deduplicates by (document_id, chunk_id).
+        """
+        sources: list[CoachSourceReference] = []
+        seen: set[tuple[Optional[str], Optional[str]]] = set()
+        for ctx in state.get("retrieved_context") or []:
+            meta = ctx.metadata if isinstance(ctx.metadata, dict) else {}
+            source_ref = meta.get("source_reference")
+            if isinstance(source_ref, dict):
+                document_id = source_ref.get("document_id")
+                chunk_id = source_ref.get("chunk_id")
+                key = (document_id, chunk_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sources.append(
+                    CoachSourceReference(
+                        document_id=document_id,
+                        document_title=source_ref.get("document_title"),
+                        chunk_id=chunk_id,
+                        page_number=source_ref.get("page_number"),
+                        section=source_ref.get("section"),
+                        score=source_ref.get("score"),
+                    )
+                )
+            elif meta.get("document_id") or meta.get("chunk_id"):
+                # Retrieval didn't attach a full source_reference (e.g. a
+                # simpler test double or adapter) but still tagged basic
+                # provenance metadata -- surface what's actually there,
+                # still never anything derived from LLM text.
+                document_id = meta.get("document_id")
+                chunk_id = meta.get("chunk_id")
+                key = (document_id, chunk_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                sources.append(
+                    CoachSourceReference(
+                        document_id=document_id,
+                        document_title=meta.get("title"),
+                        chunk_id=chunk_id,
+                        page_number=meta.get("page_number"),
+                        section=meta.get("section"),
+                        score=meta.get("score"),
+                    )
+                )
+        return sources
+
+    @staticmethod
     def _to_result(state: CoachState) -> CoachResult:
         diagnosis = state["diagnosis"]
         intervention = state["intervention"]
@@ -227,6 +282,7 @@ class Coach:
             learning_event=learning_event,
             evidence_candidates=evidence_candidates,
             risk_signals=risk_signals,
+            sources=Coach._extract_sources(state),
             metadata={
                 "turn_index": metadata.turn_index,
                 "errors": state.get("errors") or [],
