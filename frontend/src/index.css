@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@theme {
+  /* Typography */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+
+  /* Core palette — sourced from the SocratiQ mockup */
+  --color-canvas: #eef3eb;          /* page background, pale sage */
+  --color-surface: #ffffff;         /* cards, panels */
+  --color-surface-muted: #f4f8f2;   /* subtle recessed surface */
+
+  --color-ink: #443942;             /* primary text, plum-brown */
+  --color-ink-soft: #6f6169;        /* secondary text */
+  --color-ink-faint: #978a90;       /* tertiary text, placeholders */
+
+  --color-border: #dfe7db;          /* hairline borders */
+  --color-border-strong: #c9d6c3;
+
+  --color-plum: #6d5964;            /* primary brand / CTA */
+  --color-plum-dark: #58474f;
+  --color-plum-light: #ece4e6;
+
+  --color-teal: #8fc2b8;            /* secondary accent */
+  --color-teal-dark: #5c988c;
+  --color-teal-light: #e4f2ee;
+
+  --color-slate: #93a8c4;           /* tertiary accent, blue-slate */
+  --color-slate-light: #e6ecf5;
+
+  --color-clay: #b98a7a;            /* course card variant */
+  --color-clay-light: #f3e8e3;
+
+  --color-success: #6f9a7b;
+  --color-success-light: #e6f0e6;
+  --color-warning: #c98a4b;
+  --color-warning-light: #f6e9db;
+  --color-danger: #b96b64;
+  --color-danger-light: #f5e4e2;
+
+  --radius-sm: 0.5rem;
+  --radius-md: 0.75rem;
+  --radius-lg: 1rem;
+  --radius-xl: 1.25rem;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-teal-dark);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Thin scrollbar for chat + tables */
+.thin-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: var(--color-border-strong); border-radius: 999px; }
